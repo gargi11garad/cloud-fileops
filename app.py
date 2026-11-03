@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from processor import FileProcessor
@@ -25,10 +26,30 @@ def services():
     return Storage(), FileProcessor()
 
 storage, processor = services()
-mode = "AWS" if storage.aws_enabled else "Local demo"
-st.caption(f"Storage: **{mode}** · AWS mode is enabled when AWS_REGION, S3_BUCKET, and DYNAMODB_TABLE are configured.")
+api_base = os.getenv("API_BASE_URL")
+api_key = os.getenv("API_KEY")
+try:
+    api_base = api_base or st.secrets.get("API_BASE_URL")
+    api_key = api_key or st.secrets.get("API_KEY")
+except Exception:
+    pass
+remote_mode = bool(api_base and api_key)
+mode = "AWS backend via EC2 API" if remote_mode else ("AWS direct" if storage.aws_enabled else "Local demo")
+mode_detail = "Connected to the protected backend." if remote_mode else ("This process has AWS environment configuration." if storage.aws_enabled else "Configure API_BASE_URL and API_KEY in Streamlit secrets to use EC2, S3, and DynamoDB.")
+st.caption(f"Storage: **{mode}** · {mode_detail}")
 
-records = storage.list_records()
+def list_records():
+    if not remote_mode:
+        return storage.list_records()
+    try:
+        response = requests.get(f"{api_base.rstrip('/')}/files", headers={"X-API-Key": api_key}, timeout=15)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        st.error(f"Could not reach the EC2 processing API: {exc}")
+        return []
+
+records = list_records()
 total = len(records)
 done = sum(r.get("status") == "completed" for r in records)
 failed = sum(r.get("status") == "failed" for r in records)
@@ -45,17 +66,34 @@ with upload_tab:
     if uploads and st.button("Process files", type="primary"):
         progress = st.progress(0)
         for i, upload in enumerate(uploads):
-            file_id = storage.new_id()
-            item = {"file_id": file_id, "filename": upload.name, "status": "processing", "uploaded_at": datetime.now(timezone.utc).isoformat(), "content_type": upload.type or "application/octet-stream"}
-            storage.save_upload(file_id, upload.name, upload.getvalue(), item["content_type"])
-            storage.put_record(item)
             try:
-                result = processor.process(upload.name, upload.getvalue())
-                storage.save_result(file_id, result)
-                item.update(status="completed", result=result, completed_at=datetime.now(timezone.utc).isoformat())
+                contents = upload.getvalue()
+                if remote_mode:
+                    response = requests.post(
+                        f"{api_base.rstrip('/')}/files",
+                        headers={"X-API-Key": api_key},
+                        files={"file": (upload.name, contents, upload.type or "application/octet-stream")},
+                        timeout=120,
+                    )
+                    response.raise_for_status()
+                    item = response.json()
+                    if item.get("status") == "failed":
+                        st.error(f"{upload.name}: {item.get('error', 'Processing failed')}")
+                else:
+                    file_id = storage.new_id()
+                    item = {"file_id": file_id, "filename": upload.name, "status": "processing", "uploaded_at": datetime.now(timezone.utc).isoformat(), "content_type": upload.type or "application/octet-stream"}
+                    storage.save_upload(file_id, upload.name, contents, item["content_type"])
+                    storage.put_record(item)
+                    result = processor.process(upload.name, contents)
+                    storage.save_result(file_id, result)
+                    item.update(status="completed", result=result, completed_at=datetime.now(timezone.utc).isoformat())
+                    storage.put_record(item)
             except Exception as exc:
-                item.update(status="failed", error=str(exc), completed_at=datetime.now(timezone.utc).isoformat())
-            storage.put_record(item)
+                if remote_mode:
+                    st.error(f"Could not process {upload.name}: {exc}")
+                else:
+                    item.update(status="failed", error=str(exc), completed_at=datetime.now(timezone.utc).isoformat())
+                    storage.put_record(item)
             progress.progress((i + 1) / len(uploads))
         st.success(f"Processed {len(uploads)} file(s).")
         st.rerun()
@@ -77,11 +115,11 @@ with history_tab:
 with guide_tab:
     st.subheader("Connect AWS services")
     st.markdown("""
-1. Create a private S3 bucket and a DynamoDB table with partition key `file_id` (String).
-2. Set `AWS_REGION`, `S3_BUCKET`, and `DYNAMODB_TABLE` in Streamlit secrets or the EC2 environment.
-3. Attach an EC2 instance role with least-privilege access to that bucket and table. Avoid storing access keys in source code.
-4. Deploy the UI to Streamlit Community Cloud; run the API worker on EC2 using `uvicorn api:app --host 0.0.0.0 --port 8000`.
+1. Deploy `infrastructure/cloudformation.yaml` in AWS CloudFormation using a public subnet.
+2. Copy the stack's `ApiBaseUrl` output and retrieve `api_key` from the secret named by `ApiKeySecretArn`.
+3. In Streamlit Community Cloud, open **Manage app → Settings → Secrets** and set `API_BASE_URL` and `API_KEY`.
+4. The EC2 instance uses an IAM role for S3 and DynamoDB. AWS access keys do not belong in Streamlit or GitHub.
 
-The app uses local storage automatically when AWS settings are absent, so you can try the workflow before provisioning cloud resources. See `README.md` for exact IAM and deployment steps.
+The app uses local storage until the API settings are configured. See `README.md` for the stack setup and cost notes.
 """)
 

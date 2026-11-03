@@ -6,16 +6,11 @@ from pathlib import Path
 
 class Storage:
     def __init__(self):
-        # Streamlit Community Cloud injects secrets through st.secrets; EC2 uses
-        # environment variables. Environment variables take precedence.
-        try:
-            import streamlit as st
-            secrets = st.secrets
-        except Exception:
-            secrets = {}
-        self.region = os.getenv("AWS_REGION") or secrets.get("AWS_REGION")
-        self.bucket = os.getenv("S3_BUCKET") or secrets.get("S3_BUCKET")
-        self.table_name = os.getenv("DYNAMODB_TABLE") or secrets.get("DYNAMODB_TABLE")
+        # On EC2, boto3 uses the instance profile. Streamlit Cloud calls the API
+        # and does not receive AWS credentials.
+        self.region = os.getenv("AWS_REGION")
+        self.bucket = os.getenv("S3_BUCKET")
+        self.table_name = os.getenv("DYNAMODB_TABLE")
         self.aws_enabled = bool(self.region and self.bucket and self.table_name)
         self.local_root = Path(os.getenv("LOCAL_DATA_DIR", ".local_data"))
         self.local_root.mkdir(parents=True, exist_ok=True)

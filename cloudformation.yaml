@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloud FileOps starter stack with private S3, on-demand DynamoDB, and an authenticated HTTPS EC2 API.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the API instance.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with a route to an Internet Gateway.
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.micro, t4g.small]
+    Description: ARM-based EC2 size.
+
+Resources:
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: file_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_id
+          KeyType: HASH
+
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Shared API token for the Streamlit frontend and EC2 API.
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: api_key
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  ApiInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CloudFileOpsDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${UploadsBucket.Arn}/*'
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Scan]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref ApiKeySecret
+
+  ApiInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ApiInstanceRole]
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP for ACME validation and HTTPS for API; port 8000 stays private.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ApiInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          GroupSet: [!Ref ApiSecurityGroup]
+          SubnetId: !Ref SubnetId
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 12
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-api'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/cloud-init-cloudfileops.log | logger -t cloud-init-cloudfileops -s 2>/dev/console) 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y python3-venv python3-pip git curl gnupg debian-keyring debian-archive-keyring apt-transport-https
+          curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
+          apt-get update
+          apt-get install -y caddy
+          git clone --depth 1 https://github.com/gargi11garad/cloud-fileops.git /opt/cloud-fileops
+          python3 -m venv /opt/cloud-fileops/venv
+          /opt/cloud-fileops/venv/bin/pip install --no-cache-dir -r /opt/cloud-fileops/requirements.txt
+          cat > /opt/cloud-fileops/serve.py <<'PY'
+          import json, os
+          import boto3
+          secret = boto3.client('secretsmanager', region_name=os.environ['AWS_REGION']).get_secret_value(SecretId=os.environ['API_KEY_SECRET_ARN'])
+          os.environ['API_KEY'] = json.loads(secret['SecretString'])['api_key']
+          import uvicorn
+          uvicorn.run('api:app', host='127.0.0.1', port=8000)
+          PY
+          chown -R ubuntu:ubuntu /opt/cloud-fileops
+          cat > /etc/systemd/system/cloud-fileops.service <<'UNIT'
+          [Unit]
+          Description=Cloud FileOps API
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          User=ubuntu
+          Group=ubuntu
+          WorkingDirectory=/opt/cloud-fileops
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=S3_BUCKET=${UploadsBucket}
+          Environment=DYNAMODB_TABLE=${JobsTable}
+          Environment=API_KEY_SECRET_ARN=${ApiKeySecret}
+          ExecStart=/opt/cloud-fileops/venv/bin/python /opt/cloud-fileops/serve.py
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=full
+          ProtectHome=true
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          PUBLIC_IP=$(curl --fail --silent --show-error -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' | xargs -I{} sh -c "curl --fail --silent --show-error -H 'X-aws-ec2-metadata-token: {}' http://169.254.169.254/latest/meta-data/public-ipv4")
+          printf '%s {\n  reverse_proxy 127.0.0.1:8000\n}\n' "$PUBLIC_IP.sslip.io" > /etc/caddy/Caddyfile
+          systemctl daemon-reload
+          systemctl enable --now cloud-fileops caddy
+
+Outputs:
+  ApiBaseUrl:
+    Description: HTTPS API origin to set as API_BASE_URL in Streamlit Community Cloud secrets.
+    Value: !Sub 'https://${ApiInstance.PublicIp}.sslip.io'
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+  DynamoDBTableName:
+    Value: !Ref JobsTable
+  ApiKeySecretArn:
+    Description: Generated API token secret ARN; set its api_key value in Streamlit Community Cloud secrets.
+    Value: !Ref ApiKeySecret
